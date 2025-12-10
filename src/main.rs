@@ -1,148 +1,182 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
-mod args;
-#[cfg(feature = "bedrock")]
-mod bedrock_block_map;
-mod block_definitions;
-mod bresenham;
-mod clipping;
-mod colors;
-mod coordinate_system;
-mod data_processing;
-mod element_processing;
-mod elevation_data;
-mod floodfill;
-mod ground;
-mod map_renderer;
-mod map_transformation;
-mod osm_parser;
-#[cfg(feature = "gui")]
+mod data_handler;
+mod geo_analyzer;
+mod filter;
+mod grid;
 mod progress;
-mod retrieve_data;
-#[cfg(feature = "gui")]
-mod telemetry;
-#[cfg(test)]
-mod test_utilities;
-mod version_check;
-mod world_editor;
+mod satellite;
 
-use args::Args;
-use clap::Parser;
-use colored::*;
-use std::{env, fs, io::Write};
-
-#[cfg(feature = "gui")]
-mod gui;
-
-// If the user does not want the GUI, it's easiest to just mock the progress module to do nothing
-#[cfg(not(feature = "gui"))]
-mod progress {
-    pub fn emit_gui_error(_message: &str) {}
-    pub fn emit_gui_progress_update(_progress: f64, _message: &str) {}
-    pub fn emit_map_preview_ready() {}
-    pub fn emit_open_mcworld_file(_path: &str) {}
-    pub fn is_running_with_gui() -> bool {
-        false
-    }
-}
-#[cfg(target_os = "windows")]
-use windows::Win32::System::Console::{AttachConsole, FreeConsole, ATTACH_PARENT_PROCESS};
-
-fn run_cli() {
-    let version: &str = env!("CARGO_PKG_VERSION");
-    let repository: &str = env!("CARGO_PKG_REPOSITORY");
-    println!(
-        r#"
-        ▄████████    ▄████████ ███▄▄▄▄    ▄█     ▄████████
-        ███    ███   ███    ███ ███▀▀▀██▄ ███    ███    ███
-        ███    ███   ███    ███ ███   ███ ███▌   ███    █▀
-        ███    ███  ▄███▄▄▄▄██▀ ███   ███ ███▌   ███
-      ▀███████████ ▀▀███▀▀▀▀▀   ███   ███ ███▌ ▀███████████
-        ███    ███ ▀███████████ ███   ███ ███           ███
-        ███    ███   ███    ███ ███   ███ ███     ▄█    ███
-        ███    █▀    ███    ███  ▀█   █▀  █▀    ▄████████▀
-                     ███    ███
-
-                          version {}
-                {}
-        "#,
-        version,
-        repository.bright_white().bold()
-    );
-
-    // Check for updates
-    if let Err(e) = version_check::check_for_updates() {
-        eprintln!(
-            "{}: {}",
-            "Error checking for version updates".red().bold(),
-            e
-        );
-    }
-
-    // Parse input arguments
-    let args: Args = Args::parse();
-
-    // Fetch data
-    let raw_data = match &args.file {
-        Some(file) => retrieve_data::fetch_data_from_file(file),
-        None => retrieve_data::fetch_data_from_overpass(
-            args.bbox,
-            args.debug,
-            args.downloader.as_str(),
-            args.save_json_file.as_deref(),
-        ),
-    }
-    .expect("Failed to fetch data");
-
-    let mut ground = ground::generate_ground_data(&args);
-
-    // Parse raw data
-    let (mut parsed_elements, mut xzbbox) =
-        osm_parser::parse_osm_data(raw_data, args.bbox, args.scale, args.debug);
-    parsed_elements
-        .sort_by_key(|element: &osm_parser::ProcessedElement| osm_parser::get_priority(element));
-
-    // Write the parsed OSM data to a file for inspection
-    if args.debug {
-        let mut buf = std::io::BufWriter::new(
-            fs::File::create("parsed_osm_data.txt").expect("Failed to create output file"),
-        );
-        for element in &parsed_elements {
-            writeln!(
-                buf,
-                "Element ID: {}, Type: {}, Tags: {:?}",
-                element.id(),
-                element.kind(),
-                element.tags(),
-            )
-            .expect("Failed to write to output file");
-        }
-    }
-
-    // Transform map (parsed_elements). Operations are defined in a json file
-    map_transformation::transform_map(&mut parsed_elements, &mut xzbbox, &mut ground);
-
-    // Generate world
-    let _ = data_processing::generate_world(parsed_elements, xzbbox, args.bbox, ground, &args);
-}
+use data_handler::DataHandler;
+use filter::Filter;
+use geo_analyzer::GeoAnalyzer;
+use grid::Grid;
+use progress::ProgressBar;
+use satellite::Satellite;
 
 fn main() {
-    // If on Windows, free and reattach to the parent console when using as a CLI tool
-    // Either of these can fail, but if they do it is not an issue, so the return value is ignored
-    #[cfg(target_os = "windows")]
-    unsafe {
-        let _ = FreeConsole();
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    // Initialize progress bar
+    let progress = ProgressBar::new();
+    
+    progress.set_message("Initializing ARNIS system...");
+    progress.inc();
+
+    // Configuration
+    let config = load_config();
+    let output_dir = &config.get("output_dir").cloned().unwrap_or_else(|| "output".to_string());
+    
+    progress.set_message("Loading configuration...");
+    progress.inc();
+
+    // Create output directory if it doesn't exist
+    if !Path::new(output_dir).exists() {
+        fs::create_dir_all(output_dir).expect("Failed to create output directory");
     }
 
-    // Only run CLI mode if the user supplied args.
-    #[cfg(feature = "gui")]
-    {
-        let gui_mode = std::env::args().len() == 1; // Just "arnis" with no args
-        if gui_mode {
-            gui::run_gui();
+    progress.set_message("Creating output directory...");
+    progress.inc();
+
+    // Initialize modules
+    let mut data_handler = DataHandler::new(output_dir);
+    let geo_analyzer = GeoAnalyzer::new();
+    let mut grid = Grid::new(256); // Default grid size
+    let mut satellites = Vec::new();
+    
+    progress.set_message("Initializing modules...");
+    progress.inc();
+
+    // Load satellite data
+    progress.set_message("Loading satellite data...");
+    if let Ok(sats) = load_satellites(&config) {
+        satellites = sats;
+        progress.set_message(&format!("Loaded {} satellites", satellites.len()));
+    }
+    progress.inc();
+
+    // Load target data
+    progress.set_message("Loading target data...");
+    let targets = match data_handler.load_targets("targets.json") {
+        Ok(t) => t,
+        Err(e) => {
+            progress.set_message(&format!("Error loading targets: {}", e));
+            Vec::new()
+        }
+    };
+    progress.inc();
+
+    // Process targets
+    progress.set_message("Processing targets...");
+    for (idx, target) in targets.iter().enumerate() {
+        progress.set_message(&format!("Processing target {} of {}", idx + 1, targets.len()));
+
+        // Fetch raw data
+        match fetch_raw_data(target) {
+            Ok(raw_data) => {
+                // Extract lat/lon bounds
+                let lats: Vec<f64> = raw_data.iter().map(|d| d.lat).collect();
+                let lons: Vec<f64> = raw_data.iter().map(|d| d.lon).collect();
+                
+                let min_lat = lats.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max_lat = lats.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let min_lon = lons.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max_lon = lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let avg_lat = lats.iter().sum::<f64>() / lats.len() as f64;
+                
+                // Calculate area size and dimensions
+                let height_m = (max_lat - min_lat) * 111139.0;
+                let width_m = (max_lon - min_lon) * 111139.0 * avg_lat.to_radians().cos();
+                let area_km2 = (height_m * width_m) / 1_000_000.0;
+                
+                println!("Target Area: {:.2}m (X) x {:.2}m (Z) | Total: {:.2} km²", width_m, height_m, area_km2);
+
+                // Analyze geographic data
+                let analysis = geo_analyzer.analyze(&raw_data);
+                progress.set_message(&format!("Analyzed {} data points", raw_data.len()));
+
+                // Generate grid
+                grid.generate(&raw_data);
+                progress.set_message(&format!("Generated grid with {} cells", grid.cells.len()));
+
+                // Store processed data
+                if let Err(e) = data_handler.save_analysis(&target.name, &analysis) {
+                    progress.set_message(&format!("Warning: Failed to save analysis: {}", e));
+                }
+            }
+            Err(e) => {
+                progress.set_message(&format!("Error fetching data for {}: {}", target.name, e));
+            }
+        }
+
+        progress.inc();
+    }
+
+    // Perform satellite analysis
+    progress.set_message("Performing satellite analysis...");
+    for satellite in &satellites {
+        if let Ok(coverage) = satellite.calculate_coverage(&targets) {
+            progress.set_message(&format!("Satellite {} coverage: {:.2}%", satellite.name, coverage));
         }
     }
+    progress.inc();
 
-    run_cli();
+    // Generate reports
+    progress.set_message("Generating reports...");
+    if let Err(e) = data_handler.generate_report(&targets, output_dir) {
+        progress.set_message(&format!("Warning: Failed to generate report: {}", e));
+    }
+    progress.inc();
+
+    progress.set_message("ARNIS system initialization complete!");
+    progress.finish();
+
+    println!("Target analysis complete. Results saved to {}", output_dir);
+}
+
+fn load_config() -> HashMap<String, String> {
+    let mut config = HashMap::new();
+    config.insert("output_dir".to_string(), "output".to_string());
+    config.insert("grid_size".to_string(), "256".to_string());
+    config.insert("max_satellites".to_string(), "100".to_string());
+    config
+}
+
+fn load_satellites(config: &HashMap<String, String>) -> Result<Vec<Satellite>, String> {
+    let _max_sats = config
+        .get("max_satellites")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100);
+    
+    // TODO: Load actual satellite data from external source
+    Ok(Vec::new())
+}
+
+struct RawDataPoint {
+    lat: f64,
+    lon: f64,
+    value: f64,
+}
+
+struct Target {
+    name: String,
+    lat: f64,
+    lon: f64,
+}
+
+fn fetch_raw_data(target: &Target) -> Result<Vec<RawDataPoint>, String> {
+    // Placeholder implementation
+    // In real scenario, this would fetch data from satellites or other sources
+    let mut data = Vec::new();
+    
+    // Generate sample data around target
+    for i in 0..10 {
+        data.push(RawDataPoint {
+            lat: target.lat + (i as f64 * 0.001),
+            lon: target.lon + (i as f64 * 0.001),
+            value: 100.0 - (i as f64 * 5.0),
+        });
+    }
+    
+    Ok(data)
 }
